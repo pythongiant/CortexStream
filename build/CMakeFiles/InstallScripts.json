@@ -1,0 +1,10 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/srihariunnikrishnan/CortexStream/build/cmake_install.cmake",
+		"/Users/srihariunnikrishnan/CortexStream/build/src/cmake_install.cmake",
+		"/Users/srihariunnikrishnan/CortexStream/build/tests/cmake_install.cmake",
+		"/Users/srihariunnikrishnan/CortexStream/build/examples/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

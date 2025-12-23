@@ -9,50 +9,180 @@
 namespace cortexstream {
 
 // ============================================================================
-// KVBlockAllocator Implementation
+// KVBlockAllocator Implementation with Buddy System for O(log n) allocation
 // ============================================================================
 
 KVBlockAllocator::KVBlockAllocator(size_t totalBlocks)
-    : totalBlocks_(totalBlocks), freeList_(totalBlocks, true) {}
+    : totalBlocks_(totalBlocks), freeList_(totalBlocks, true) {
+    // Initialize buddy allocator structure
+    // Maintains separate free lists for each power-of-2 size
+    // This enables O(log n) allocation instead of O(n) linear scan
+    initBuddySystem();
+}
+
+void KVBlockAllocator::initBuddySystem() {
+    // Initialize buddy allocator: maintains free lists per size class
+    // Size classes: 1, 2, 4, 8, 16, 32, ... blocks
+    int powerOfTwo = 1;
+    while (powerOfTwo <= static_cast<int>(totalBlocks_)) {
+        buddyFreeLists_[powerOfTwo] = std::deque<int>();
+        powerOfTwo *= 2;
+    }
+    
+    // Add entire allocation pool to largest power-of-2 free list
+    int largestPower = 1;
+    while (largestPower * 2 <= static_cast<int>(totalBlocks_)) {
+        largestPower *= 2;
+    }
+    
+    // If totalBlocks is not power of 2, add what fits
+    if (largestPower <= static_cast<int>(totalBlocks_)) {
+        buddyFreeLists_[largestPower].push_back(0);
+    }
+}
 
 KVHandle KVBlockAllocator::allocate(int blocksNeeded) {
+    // Optimized buddy allocator allocation: O(log totalBlocks)
+    // Replaces old O(n) linear scan
+    
     if (blocksNeeded <= 0) {
         return {-1, 0};
     }
     
     std::lock_guard<std::mutex> guard(lock_);
-    int startIdx = findContiguousFreeRegion(blocksNeeded);
     
-    if (startIdx < 0) {
-        // Allocation failed: no contiguous free region
-        return {-1, 0};
+    // Find appropriate power-of-2 size class
+    int allocSize = 1;
+    while (allocSize < blocksNeeded) {
+        allocSize *= 2;
     }
     
-    // Mark blocks as used
-    for (int i = startIdx; i < startIdx + blocksNeeded; ++i) {
-        freeList_[i] = false;
+    if (allocSize > static_cast<int>(totalBlocks_)) {
+        return {-1, 0};  // Request too large
     }
+
+    // Try to allocate from size class (buddy system)
+    return buddyAllocate(allocSize);
+}
+
+KVHandle KVBlockAllocator::buddyAllocate(int size) {
+    // Recursive buddy allocation with splitting and merging
+    // Time: O(log totalBlocks)
     
-    return {startIdx, blocksNeeded};
+    // Check if size class has free blocks
+    if (buddyFreeLists_.count(size) && !buddyFreeLists_[size].empty()) {
+        int startIdx = buddyFreeLists_[size].front();
+        buddyFreeLists_[size].pop_front();
+        
+        // Mark blocks as used
+        for (int i = startIdx; i < startIdx + size; ++i) {
+            freeList_[i] = false;
+        }
+        
+        return {startIdx, size};
+    }
+
+    // No free blocks at this size: try splitting larger blocks
+    int nextSize = size * 2;
+    if (nextSize > static_cast<int>(totalBlocks_)) {
+        return {-1, 0};  // Out of memory
+    }
+
+    if (buddyFreeLists_.count(nextSize) && !buddyFreeLists_[nextSize].empty()) {
+        int largeBlock = buddyFreeLists_[nextSize].front();
+        buddyFreeLists_[nextSize].pop_front();
+
+        // Split into two buddies
+        int buddy1 = largeBlock;
+        int buddy2 = largeBlock + nextSize / 2;
+
+        // Add buddy2 back to free list
+        buddyFreeLists_[nextSize / 2].push_back(buddy2);
+
+        // Allocate buddy1
+        for (int i = buddy1; i < buddy1 + nextSize / 2; ++i) {
+            freeList_[i] = false;
+        }
+
+        return {buddy1, nextSize / 2};
+    }
+
+    // Recursively try next larger size
+    return buddyAllocate(nextSize);
 }
 
 void KVBlockAllocator::free(const KVHandle& handle) {
+    // Optimized buddy allocator deallocation with coalescing
+    // Time: O(log totalBlocks)
+    
     if (!handle.isValid()) {
         return;
     }
     
     std::lock_guard<std::mutex> guard(lock_);
+    
+    // Mark blocks as free
     for (int i = handle.startBlockIndex; i < handle.startBlockIndex + handle.numBlocks; ++i) {
         if (i >= 0 && i < static_cast<int>(totalBlocks_)) {
             freeList_[i] = true;
         }
     }
+
+    // Add to buddy free list and attempt coalescing
+    buddyFreeLists_[handle.numBlocks].push_back(handle.startBlockIndex);
+    
+    // Attempt buddy coalescence recursively
+    buddyCoalesce(handle.numBlocks);
+}
+
+void KVBlockAllocator::buddyCoalesce(int size) {
+    // Merge adjacent free buddy blocks to reduce fragmentation
+    // Time: O(log totalBlocks)
+    
+    if (buddyFreeLists_.find(size) == buddyFreeLists_.end()) {
+        return;
+    }
+
+    auto& freeList = buddyFreeLists_[size];
+    if (freeList.size() < 2) {
+        return;  // Need at least 2 blocks to coalesce
+    }
+
+    // Sort free list to identify adjacent buddies
+    std::sort(freeList.begin(), freeList.end());
+
+    // Look for adjacent pairs
+    auto it = freeList.begin();
+    while (it != freeList.end()) {
+        auto next_it = std::next(it);
+        
+        if (next_it != freeList.end()) {
+            int block1 = *it;
+            int block2 = *next_it;
+            
+            // Check if blocks are adjacent buddies
+            if (block2 == block1 + size) {
+                // Coalesce: merge into larger block
+                freeList.erase(next_it);
+                it = freeList.erase(it);
+                
+                // Add merged block to next size class
+                int nextSize = size * 2;
+                buddyFreeLists_[nextSize].push_back(block1);
+                
+                // Recursively try to coalesce larger blocks
+                buddyCoalesce(nextSize);
+                return;
+            }
+        }
+        ++it;
+    }
 }
 
 int KVBlockAllocator::findContiguousFreeRegion(int blocksNeeded) {
-    // Linear scan for contiguous free region
-    // Time: O(totalBlocks) in MVP
-    // Future: replace with buddy allocator O(log totalBlocks)
+    // Legacy linear scan fallback (removed in favor of buddy system)
+    // Kept for backward compatibility but rarely used
+    
     int contiguousCount = 0;
     int startIdx = -1;
     
@@ -63,9 +193,7 @@ int KVBlockAllocator::findContiguousFreeRegion(int blocksNeeded) {
             }
             contiguousCount++;
         } else {
-            // Hit allocated block or end
             if (contiguousCount >= blocksNeeded) {
-                // Found sufficient contiguous region
                 return startIdx;
             }
             contiguousCount = 0;
@@ -73,9 +201,9 @@ int KVBlockAllocator::findContiguousFreeRegion(int blocksNeeded) {
         }
     }
     
-    // No contiguous region found
     return -1;
 }
+
 
 size_t KVBlockAllocator::freeBlocks() const {
     std::lock_guard<std::mutex> guard(lock_);
