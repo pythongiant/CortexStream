@@ -43,7 +43,7 @@
 - Implementation alignment
 - Code correspondence
 - Testing strategy
-- Performance characteristics
+- Performance characteristics   
 
 ---
 
