@@ -13,4 +13,3 @@ It focuses on the *real bottlenecks* of large language model serving:
 * Minimal overhead compute pipeline on **MLX + MPS**
 
 Designed to demonstrate that Apple Silicon can serve LLMs *not just locally… but seriously*.
-# CortexStream

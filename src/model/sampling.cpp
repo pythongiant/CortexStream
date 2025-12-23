@@ -1,21 +1,207 @@
 #include "cortexstream/sampler.h"
 #include <algorithm>
 #include <cmath>
-#include <random>
 #include <numeric>
+#include <random>
+#include <stdexcept>
+#include <iostream>
+#include <limits>
 
 namespace cortexstream {
 
-Sampler::Sampler(uint32_t seed) : seed(seed) {
+// Validation helper
+bool SamplingParams::validate() const {
+    if (temperature < 0.0f) return false;
+    if (topK < 1 && topK != 0) return false;
+    if (topP < 0.0f || topP > 1.0f) return false;
+    if (repetitionPenalty < 1.0f) return false;
+    return true;
+}
+
+Sampler::Sampler() {
+    initRNG();
 }
 
 Sampler::~Sampler() = default;
 
-int Sampler::greedy(const Tensor& logits) {
+void Sampler::setParams(const SamplingParams& newParams) {
+    if (!newParams.validate()) {
+        throw std::invalid_argument("Invalid sampling parameters");
+    }
+    params = newParams;
+    initRNG();
+}
+
+const SamplingParams& Sampler::getParams() const {
+    return params;
+}
+
+void Sampler::setSeed(int seed) {
+    params.seed = seed;
+    initRNG();
+}
+
+std::optional<SamplingMetadata> Sampler::getLastMetadata() const {
+    return lastMetadata;
+}
+
+int Sampler::sampleToken(const Tensor& logits,
+                        const std::vector<int>& generatedHistory) {
     if (logits.shape.empty() || logits.data.empty()) {
+        throw std::invalid_argument("Invalid logits tensor");
+    }
+
+    // Make working copy
+    Tensor workingLogits = logits;
+
+    // Step 1: Apply repetition penalty if enabled
+    if (params.repetitionPenaltyEnabled && !generatedHistory.empty()) {
+        workingLogits = applyRepetitionPenalty(workingLogits, generatedHistory);
+    }
+
+    // Step 2: Greedy override
+    if (params.doSample || (params.topK == 1 && params.topP >= 1.0f)) {
+        return greedySelect(workingLogits);
+    }
+
+    // Step 3: Apply temperature
+    if (params.temperature != 1.0f) {
+        workingLogits = applyTemperature(workingLogits);
+    }
+
+    // Step 4: Route to sampling strategy
+    int selectedToken = -1;
+
+    if (params.topK > 1 && params.topP < 1.0f) {
+        // Top-K + Top-P combined
+        selectedToken = topKPSample(workingLogits);
+    } else if (params.topK > 1) {
+        // Top-K only
+        selectedToken = topKSample(workingLogits);
+    } else if (params.topP < 1.0f) {
+        // Top-P (Nucleus) only
+        selectedToken = topPSample(workingLogits);
+    } else {
+        // Fallback to greedy
+        selectedToken = greedySelect(workingLogits);
+    }
+
+    return selectedToken;
+}
+
+std::vector<int> Sampler::sampleBatch(
+    const Tensor& batchedLogits,
+    const std::vector<std::vector<int>>& histories) {
+    
+    // MVP: Simple sequential sampling per sequence
+    // Future: Vectorized batch operations on GPU
+    
+    std::vector<int> tokens;
+    
+    int batchSize = batchedLogits.shape[0];
+    int vocabSize = batchedLogits.shape[1];
+    
+    for (int i = 0; i < batchSize; ++i) {
+        // Extract logits for this sequence
+        Tensor seqLogits;
+        seqLogits.shape = {1, static_cast<int64_t>(vocabSize)};
+        seqLogits.data.resize(vocabSize);
+        
+        std::copy(
+            batchedLogits.data.begin() + i * vocabSize,
+            batchedLogits.data.begin() + (i + 1) * vocabSize,
+            seqLogits.data.begin()
+        );
+
+        // Sample using history if provided
+        auto history = !histories.empty() ? histories[i] : std::vector<int>{};
+        int token = sampleToken(seqLogits, history);
+        tokens.push_back(token);
+    }
+
+    return tokens;
+}
+
+void Sampler::initRNG() {
+    if (params.seed >= 0) {
+        rng.seed(params.seed);
+    } else {
+        std::random_device rd;
+        rng.seed(rd());
+    }
+}
+
+Tensor Sampler::applyTemperature(const Tensor& logits) {
+    if (params.temperature <= 0.0f) {
+        throw std::invalid_argument("Temperature must be positive");
+    }
+
+    Tensor result = logits;
+    for (auto& val : result.data) {
+        val = val / params.temperature;
+    }
+    return result;
+}
+
+Tensor Sampler::applyRepetitionPenalty(const Tensor& logits,
+                                       const std::vector<int>& history) {
+    if (params.repetitionPenalty <= 1.0f) {
+        return logits;  // No penalty
+    }
+
+    Tensor result = logits;
+    
+    // Count token frequencies in history
+    std::vector<int> frequencies(result.data.size(), 0);
+    for (int token : history) {
+        if (token >= 0 && token < static_cast<int>(result.data.size())) {
+            frequencies[token]++;
+        }
+    }
+
+    // Apply penalty: reduce logits of repeated tokens
+    for (size_t i = 0; i < result.data.size(); ++i) {
+        if (frequencies[i] > 0) {
+            // Penalty reduces probability
+            if (result.data[i] > 0) {
+                result.data[i] = result.data[i] / params.repetitionPenalty;
+            } else {
+                result.data[i] = result.data[i] * params.repetitionPenalty;
+            }
+        }
+    }
+
+    return result;
+}
+
+Tensor Sampler::softmaxNormalize(const Tensor& logits) {
+    Tensor result = logits;
+    
+    // Numerical stability: subtract max
+    float maxLogit = *std::max_element(result.data.begin(), result.data.end());
+    
+    // Exp and sum
+    float sum = 0.0f;
+    for (auto& val : result.data) {
+        val = std::exp(std::clamp(val - maxLogit, MIN_LOGIT, MAX_LOGIT));
+        sum += val;
+    }
+
+    // Normalize
+    if (sum > 0.0f) {
+        for (auto& val : result.data) {
+            val = val / sum;
+        }
+    }
+
+    return result;
+}
+
+int Sampler::greedySelect(const Tensor& logits) {
+    if (logits.data.empty()) {
         return 0;
     }
-    
+
     int maxIdx = 0;
     float maxVal = logits.data[0];
     
@@ -25,192 +211,293 @@ int Sampler::greedy(const Tensor& logits) {
             maxIdx = i;
         }
     }
-    
+
     return maxIdx;
 }
 
-int Sampler::topK(const Tensor& logits, int k, float temperature) {
-    if (logits.shape.empty() || logits.data.empty()) {
+int Sampler::topKSample(const Tensor& logits) {
+    auto topKPairs = getTopK(logits.data, params.topK);
+    
+    if (topKPairs.empty()) {
         return 0;
     }
-    
-    auto topKIdx = topKIndices(logits, k);
-    
-    // Apply temperature and softmax
-    std::vector<float> scores;
-    scores.reserve(topKIdx.size());
-    
-    float maxScore = topKIdx[0].first;
-    for (const auto& [logit, idx] : topKIdx) {
-        scores.push_back(logit / temperature);
-    }
-    
-    auto probs = softmax(scores, temperature);
-    return sampleFromDistribution(probs);
-}
 
-int Sampler::topP(const Tensor& logits, float p, float temperature) {
-    if (logits.shape.empty() || logits.data.empty()) {
-        return 0;
+    // Convert to probabilities
+    std::vector<float> probs;
+    probs.reserve(topKPairs.size());
+    
+    float maxVal = topKPairs[0].first;
+    float sumExp = 0.0f;
+    
+    for (const auto& [logit, idx] : topKPairs) {
+        float p = std::exp(std::clamp(logit - maxVal, MIN_LOGIT, MAX_LOGIT));
+        probs.push_back(p);
+        sumExp += p;
     }
-    
-    // Sort all logits
-    std::vector<std::pair<float, int>> scored;
-    scored.reserve(logits.data.size());
-    
-    for (size_t i = 0; i < logits.data.size(); ++i) {
-        scored.emplace_back(logits.data[i], i);
-    }
-    
-    std::sort(scored.begin(), scored.end(),
-             [](const auto& a, const auto& b) { return a.first > b.first; });
-    
-    // Find nucleus tokens (top-p)
-    std::vector<float> scores;
-    std::vector<int> indices;
-    
-    float cumProb = 0.0f;
-    float maxScore = scored[0].first;
-    float denom = 0.0f;
-    
-    for (const auto& [logit, idx] : scored) {
-        float score = (logit - maxScore) / temperature;
-        float expScore = std::exp(score);
-        denom += expScore;
-        
-        scores.push_back(expScore);
-        indices.push_back(idx);
-        
-        cumProb += expScore;
-        
-        // Stop when cumulative probability exceeds p
-        if (cumProb > p * (cumProb + std::exp((scored.back().first - maxScore) / temperature))) {
-            break;
+
+    // Normalize
+    if (sumExp > 0.0f) {
+        for (auto& p : probs) {
+            p /= sumExp;
         }
     }
-    
-    // Normalize probabilities
-    for (auto& s : scores) {
-        s /= denom;
-    }
-    
-    return sampleFromDistribution(scores);
+
+    // Sample
+    int sampledIdx = categoricalSample(probs);
+    return topKPairs[sampledIdx].second;
 }
 
-int Sampler::topKP(const Tensor& logits, int k, float p, float temperature) {
-    if (logits.shape.empty() || logits.data.empty()) {
+int Sampler::topPSample(const Tensor& logits) {
+    // Convert to probabilities
+    Tensor probs = softmaxNormalize(logits);
+    
+    auto topIndices = getNucleus(probs.data, params.topP);
+    
+    if (topIndices.empty()) {
         return 0;
     }
-    
-    auto topKIdx = topKIndices(logits, k);
-    
-    // Apply top-p within top-k
-    std::vector<float> scores;
-    float maxScore = topKIdx[0].first;
-    
-    for (const auto& [logit, idx] : topKIdx) {
-        float score = (logit - maxScore) / temperature;
-        scores.push_back(std::exp(score));
-    }
-    
-    // Normalize
+
+    // Renormalize nucleus probabilities
+    std::vector<float> nucProbs;
     float sum = 0.0f;
-    for (auto s : scores) sum += s;
-    for (auto& s : scores) s /= sum;
     
-    // Apply top-p threshold
-    std::vector<std::pair<float, int>> probs;
-    for (size_t i = 0; i < scores.size(); ++i) {
-        probs.emplace_back(scores[i], i);
+    for (const auto& [prob, idx] : topIndices) {
+        nucProbs.push_back(prob);
+        sum += prob;
     }
+
+    if (sum > 0.0f) {
+        for (auto& p : nucProbs) {
+            p /= sum;
+        }
+    }
+
+    // Sample
+    int sampledIdx = categoricalSample(nucProbs);
+    return topIndices[sampledIdx].second;
+}
+
+int Sampler::topKPSample(const Tensor& logits) {
+    // Apply both constraints: top-K AND top-P
     
-    std::sort(probs.begin(), probs.end(),
-             [](const auto& a, const auto& b) { return a.first > b.first; });
+    // Step 1: Get top-K
+    auto topK = getTopK(logits.data, params.topK);
     
+    if (topK.empty()) {
+        return 0;
+    }
+
+    // Step 2: Convert to probabilities
+    float maxVal = topK[0].first;
+    std::vector<float> probs;
+    float sumExp = 0.0f;
+    
+    for (const auto& [logit, idx] : topK) {
+        float p = std::exp(std::clamp(logit - maxVal, MIN_LOGIT, MAX_LOGIT));
+        probs.push_back(p);
+        sumExp += p;
+    }
+
+    if (sumExp > 0.0f) {
+        for (auto& p : probs) {
+            p /= sumExp;
+        }
+    }
+
+    // Step 3: Apply nucleus filter
+    std::vector<float> filtered;
     float cumProb = 0.0f;
-    std::vector<float> finalProbs;
-    for (const auto& [prob, i] : probs) {
-        cumProb += prob;
-        finalProbs.push_back(prob);
-        if (cumProb > p) break;
-    }
     
+    for (float p : probs) {
+        cumProb += p;
+        if (cumProb <= params.topP) {
+            filtered.push_back(p);
+        }
+    }
+
+    if (filtered.empty()) {
+        filtered = probs;  // Fallback
+    }
+
     // Renormalize
-    float finalSum = 0.0f;
-    for (auto p : finalProbs) finalSum += p;
-    for (auto& p : finalProbs) p /= finalSum;
-    
-    return sampleFromDistribution(finalProbs);
-}
-
-void Sampler::setSeed(uint32_t newSeed) {
-    seed = newSeed;
-}
-
-std::vector<std::pair<float, int>> Sampler::topKIndices(const Tensor& logits, int k) {
-    std::vector<std::pair<float, int>> scored;
-    scored.reserve(logits.data.size());
-    
-    for (size_t i = 0; i < logits.data.size(); ++i) {
-        scored.emplace_back(logits.data[i], i);
+    float newSum = std::accumulate(filtered.begin(), filtered.end(), 0.0f);
+    if (newSum > 0.0f) {
+        for (auto& p : filtered) {
+            p /= newSum;
+        }
     }
+
+    // Sample
+    int sampledIdx = categoricalSample(filtered);
     
-    k = std::min(k, static_cast<int>(scored.size()));
-    
-    std::nth_element(scored.begin(), scored.begin() + k, scored.end(),
-                    [](const auto& a, const auto& b) { return a.first > b.first; });
-    
-    std::vector<std::pair<float, int>> result(scored.begin(), scored.begin() + k);
-    std::sort(result.begin(), result.end(),
-             [](const auto& a, const auto& b) { return a.first > b.first; });
-    
-    return result;
+    // Map back to original token indices
+    int count = 0;
+    for (size_t i = 0; i < probs.size(); ++i) {
+        float cumProb2 = 0.0f;
+        for (float p : filtered) {
+            cumProb2 += p;
+            if (cumProb2 >= params.topP) break;
+        }
+        if (count == sampledIdx) {
+            return topK[i].second;
+        }
+        count++;
+    }
+
+    return topK.back().second;
 }
 
-std::vector<float> Sampler::softmax(const std::vector<float>& logits, float temperature) {
+std::vector<std::pair<float, int>> Sampler::getTopK(
+    const std::vector<float>& logits, int k) {
+    
     if (logits.empty()) {
         return {};
     }
+
+    int actualK = std::min(k, static_cast<int>(logits.size()));
     
-    std::vector<float> result;
-    result.reserve(logits.size());
+    // Create pairs
+    std::vector<std::pair<float, int>> pairs;
+    pairs.reserve(logits.size());
     
-    float maxLogit = *std::max_element(logits.begin(), logits.end());
-    float sum = 0.0f;
-    
-    for (float logit : logits) {
-        float exp_val = std::exp((logit - maxLogit) / temperature);
-        result.push_back(exp_val);
-        sum += exp_val;
+    for (size_t i = 0; i < logits.size(); ++i) {
+        pairs.emplace_back(logits[i], i);
     }
-    
-    for (auto& val : result) {
-        val /= sum;
-    }
-    
+
+    // Partial sort to get top-K
+    std::nth_element(
+        pairs.begin(),
+        pairs.begin() + actualK,
+        pairs.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; }
+    );
+
+    // Extract top-K
+    std::vector<std::pair<float, int>> result(
+        pairs.begin(),
+        pairs.begin() + actualK
+    );
+
+    // Sort descending
+    std::sort(
+        result.begin(),
+        result.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; }
+    );
+
     return result;
 }
 
-int Sampler::sampleFromDistribution(const std::vector<float>& probs) {
+std::vector<std::pair<float, int>> Sampler::getNucleus(
+    const std::vector<float>& probs, float p) {
+    
+    if (probs.empty() || p >= 1.0f) {
+        // Return all
+        std::vector<std::pair<float, int>> result;
+        for (size_t i = 0; i < probs.size(); ++i) {
+            result.emplace_back(probs[i], i);
+        }
+        return result;
+    }
+
+    // Create pairs and sort
+    std::vector<std::pair<float, int>> pairs;
+    pairs.reserve(probs.size());
+    
+    for (size_t i = 0; i < probs.size(); ++i) {
+        pairs.emplace_back(probs[i], i);
+    }
+
+    std::sort(
+        pairs.begin(),
+        pairs.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; }
+    );
+
+    // Find nucleus (cumulative probability >= p)
+    std::vector<std::pair<float, int>> nucleus;
+    float cumProb = 0.0f;
+    
+    for (const auto& [prob, idx] : pairs) {
+        cumProb += prob;
+        nucleus.emplace_back(prob, idx);
+        
+        if (cumProb >= p) {
+            break;
+        }
+    }
+
+    return nucleus;
+}
+
+int Sampler::categoricalSample(const std::vector<float>& probs) {
     if (probs.empty()) {
         return 0;
     }
+
+    // Validate probabilities
+    float sum = std::accumulate(probs.begin(), probs.end(), 0.0f);
+    if (sum <= 0.0f || !std::isfinite(sum)) {
+        // Fallback: return highest
+        return std::max_element(probs.begin(), probs.end()) - probs.begin();
+    }
+
+    // Sample using inverse transform
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    float rand = dist(rng);
     
-    std::mt19937 gen(seed);
-    std::uniform_real_distribution<> dis(0.0, 1.0);
-    
-    float r = dis(gen);
     float cumProb = 0.0f;
-    
     for (size_t i = 0; i < probs.size(); ++i) {
         cumProb += probs[i];
-        if (r < cumProb) {
+        if (rand < cumProb) {
             return i;
         }
     }
-    
+
     return probs.size() - 1;
 }
 
+float Sampler::computeEntropy(const std::vector<float>& probs) {
+    float entropy = 0.0f;
+    const float epsilon = 1e-10f;
+    
+    for (float p : probs) {
+        if (p > epsilon) {
+            entropy -= p * std::log(p);
+        }
+    }
+
+    return entropy;
+}
+
+void Sampler::safeSoftmax(std::vector<float>& logits, float temperature) {
+    if (logits.empty()) return;
+
+    // Numerical stability: subtract max
+    float maxLogit = *std::max_element(logits.begin(), logits.end());
+    
+    // Apply temperature
+    float sum = 0.0f;
+    for (auto& val : logits) {
+        float scaled = (val - maxLogit) / temperature;
+        val = std::exp(std::clamp(scaled, MIN_LOGIT, MAX_LOGIT));
+        sum += val;
+    }
+
+    // Normalize
+    if (sum > 0.0f) {
+        for (auto& val : logits) {
+            val = val / sum;
+        }
+    } else {
+        // Fallback: uniform
+        float uniform = 1.0f / logits.size();
+        for (auto& val : logits) {
+            val = uniform;
+        }
+    }
+}
+
 }  // namespace cortexstream
+
 
