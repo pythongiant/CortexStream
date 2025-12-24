@@ -162,11 +162,11 @@ void InferenceEngine::processPrefill(const Batch& prefillBatch) {
     for (int i = 0; i < batchSize; ++i) {
         const auto& req = prefillBatch.requests[i];
         try {
-            int blockId = cache->allocateBlock(req->getId());
-            if (blockId < 0) {
+            bool ok = cache->allocateFor(req->getId(), req->getPromptLength());
+            if (!ok) {
                 #pragma omp critical
                 {
-                    std::cerr << "[InferenceEngine] KV allocation failed for request: " 
+                    std::cerr << "[InferenceEngine] KV allocation failed for request: "
                               << req->getId() << std::endl;
                     handleOOM();
                 }
@@ -249,7 +249,7 @@ void InferenceEngine::emitTokens(const Batch& batch, const Tensor& logits) {
             // Atomic update to request (thread-safe)
             #pragma omp critical
             {
-                req->addToken(nextToken);
+                req->addGeneratedToken(nextToken);
                 stats.tokensProcessed++;
                 
                 // Check if request is finished
@@ -290,7 +290,7 @@ void InferenceEngine::cleanup() {
 
 void InferenceEngine::cleanupRequest(const std::string& requestId) {
     // Free KV cache blocks
-    cache->clearRequest(requestId);
+    cache->freeFor(requestId);
     
     std::cout << "[InferenceEngine] Cleaned up request: " << requestId << std::endl;
 }

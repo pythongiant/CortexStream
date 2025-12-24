@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <utility>
 
 namespace cortexstream {
 
@@ -24,9 +25,7 @@ struct ResponseChunk {
     bool finished;              // Whether sequence is complete
     
     ResponseChunk() = default;
-    ResponseChunk(const std::string& reqId, int tok, 
-                  const std::string& text, bool done)
-        : requestId(reqId), token(tok), textPiece(text), finished(done) {}
+    ResponseChunk(const std::string& reqId, int tok, const std::string& textPiece);
 };
 
 // ============================================================================
@@ -64,35 +63,41 @@ public:
     
     const std::string& getText() const;
     void appendText(const std::string& text);
+    void setText(const std::string& text);
     
     const std::vector<int>& getTokens() const;
     void addToken(int token);
-    
-    int getTokenCount() const;
+    void setTokens(const std::vector<int>& tokens);
     
     // ---- Optional Debug Info ----
     
     const std::vector<float>& getLogprobs() const;
-    void setLogprobs(const std::vector<float>& probs);
+    void setLogprobs(const std::vector<float>& logprobs);
     
-    const std::vector<std::vector<float>>& getTopKLogprobs() const;
-    void setTopKLogprobs(const std::vector<std::vector<float>>& probs);
+    const std::vector<std::vector<std::pair<int, float>>>& getTopKLogprobs() const;
+    void setTopKLogprobs(
+        const std::vector<std::vector<std::pair<int, float>>>& topk);
+    void addTopKForToken(
+        const std::vector<std::pair<int, float>>& topk);
 
     // ---- Completion Reason ----
     
     bool isFinished() const;
-    void markFinished();
+    void finish();
     
-    bool stoppedByEOS() const;
+    bool hasStoppedByEOS() const;
     void setStoppedByEOS();
     
-    bool stoppedByLimit() const;
-    void setStoppedByLimit();
+    bool hasStoppedByMaxTokens() const;
+    void setStoppedByMaxTokens();
     
-    bool stoppedByString() const;
-    void setStoppedByString();
+    bool hasStoppedByStopString() const;
+    void setStoppedByStopString();
     
-    bool stoppedByUser() const;
+    bool hasStoppedByStopToken() const;
+    void setStoppedByStopToken();
+    
+    bool hasStoppedByUser() const;
     void setStoppedByUser();
     
     // ---- Error State ----
@@ -106,22 +111,21 @@ public:
     int getInputTokenCount() const;
     void setInputTokenCount(int count);
     
-    int getGeneratedTokenCount() const;
-    int getTotalTokenCount() const;
+    int getOutputTokenCount() const;
     
     uint64_t getStartTimeNs() const;
-    void setStartTimeNs(uint64_t ns);
-    
     uint64_t getEndTimeNs() const;
-    void setEndTimeNs(uint64_t ns);
+    uint64_t getLatencyNs() const;
     
     double getLatencyMs() const;
-    double getThroughputTokPerSec() const;
+    double getLatencySec() const;
+    double getTokensPerSecond() const;
+    double getAverageTokenLatencyMs() const;
 
     // ---- Utility ----
     
     std::string getCompletionReason() const;
-    bool isSuccess() const;
+    std::string toString() const;
 
 private:
     // Identity
@@ -133,13 +137,14 @@ private:
     
     // Optional debug
     std::vector<float> logprobs_;
-    std::vector<std::vector<float>> topkLogprobs_;
+    std::vector<std::vector<std::pair<int, float>>> topkLogprobs_;
     
     // Completion reason (mutually exclusive)
     bool finished_ = false;
     bool stoppedByEOS_ = false;
-    bool stoppedByLimit_ = false;
-    bool stoppedByString_ = false;
+    bool stoppedByMaxTokens_ = false;
+    bool stoppedByStopString_ = false;
+    bool stoppedByStopToken_ = false;
     bool stoppedByUser_ = false;
     
     // Error

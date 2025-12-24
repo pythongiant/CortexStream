@@ -131,14 +131,11 @@ private:
 // KVCache: Logical KV memory system
 // ============================================================================
 
-/**
- * Simple Tensor abstraction for slicing.
- * In production, this would be a proper MLX tensor.
- */
-struct Tensor {
-    float* data;
-    std::vector<size_t> shape;  // [layers, heads, blockSize, headDim] etc.
-    bool valid;
+// Lightweight tensor view for KV slices (distinct from model::Tensor)
+struct KVView {
+    float* data = nullptr;
+    std::vector<size_t> shape;  // [numHeads, tokensUsed, headDim]
+    bool valid = false;
 };
 
 /**
@@ -185,6 +182,10 @@ public:
                      size_t headDim,
                      size_t maxTotalTokens,
                      size_t blockSize = 16);
+    // Legacy convenience overload (cacheBytes, hiddenSize, numLayers)
+    explicit KVCache(size_t cacheBytes,
+                     size_t hiddenSize,
+                     size_t numLayers);
     ~KVCache();
 
     // ---- Sequence Allocation ----
@@ -212,14 +213,14 @@ public:
      * References arena memory directly—no copy.
      * View shape: [numLayers, numHeads, tokensUsed, headDim]
      */
-    Tensor getKView(const std::string& requestId, int layer);
+    KVView getKView(const std::string& requestId, int layer);
 
     /**
      * Get V tensor view for a sequence.
      * References arena memory directly—no copy.
      * View shape: [numLayers, numHeads, tokensUsed, headDim]
      */
-    Tensor getVView(const std::string& requestId, int layer);
+    KVView getVView(const std::string& requestId, int layer);
 
     // ---- Token Management ----
 

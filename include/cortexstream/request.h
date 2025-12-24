@@ -1,29 +1,45 @@
 #ifndef CORTEXSTREAM_REQUEST_H
 #define CORTEXSTREAM_REQUEST_H
 
-#include <string>
-#include <memory>
-#include <vector>
-#include <functional>
-#include <chrono>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace cortexstream {
 
-// ============================================================================
-// SamplingParams: Control token sampling behavior
-// ============================================================================
+// Request lifecycle states used by the scheduler/engine
+enum class RequestState {
+    Pending,
+    Prefilling,
+    Decoding,
+    Finished,
+    Failed
+};
 
+// Sampling configuration (shared with sampler/model backend)
 struct SamplingParams {
-    float temperature = 1.0f;          // Softmax temperature
-    int topK = 40;                     // Top-K filtering
-    float topP = 0.9f;                 // Nucleus (top-P) sampling
-    bool greedy = false;               // Argmax instead of sampling
-    uint32_t seed = 0;                 // For determinism (0 = random)
-    float repetitionPenalty = 1.0f;    // Penalize repeated tokens
-    
-    bool isValid() const;
+    // Core strategies
+    float temperature = 1.0f;
+    int topK = 1;
+    float topP = 1.0f;
+    bool doSample = false;
+
+    // Penalties
+    bool repetitionPenaltyEnabled = false;
+    float repetitionPenalty = 1.1f;
+
+    // Determinism
+    int seed = -1;  // -1 = random
+
+    // Diagnostics
+    bool returnLogprobs = false;
+    bool returnMetadata = false;
+
+    bool validate() const;
 };
 
 // ============================================================================
@@ -42,28 +58,26 @@ struct SamplingParams {
  */
 class Request {
 public:
-    /**
-     * Create a new inference request.
-     * 
-     * @param id              Unique request identifier
-     * @param prompt          Input prompt text
-     * @param inputTokens     Pre-tokenized input
-     * @param maxTokens       Maximum output tokens (default 256)
-     */
+    // Create a request with pre-tokenized prompt
     explicit Request(const std::string& id,
-                     const std::string& prompt,
-                     const std::vector<int>& inputTokens,
+                     const std::vector<int>& promptTokens,
+                     int maxTokens = 256,
+                     const std::string& promptText = "");
+    // Legacy convenience: accepts raw prompt text (simple byte-level tokenization)
+    explicit Request(const std::string& id,
+                     const std::string& promptText,
                      int maxTokens = 256);
     ~Request();
 
     // ---- Immutable Input ----
-    
     const std::string& getId() const;
-    const std::string& getPrompt() const;
-    const std::vector<int>& getInputTokens() const;
-    int getInputTokenCount() const;
+    const std::string& getPrompt() const;              // legacy alias
+    const std::string& getPromptText() const;
+    const std::vector<int>& getInputTokens() const;    // legacy alias
+    const std::vector<int>& getPromptTokens() const;
+    int getInputTokenCount() const;                    // legacy alias
+    int getPromptLength() const;
     int getMaxTokens() const;
-    int getMinTokens() const;
     
     // ---- Configuration ----
     
@@ -78,19 +92,8 @@ public:
     
     // ---- Scheduling Controls ----
     
-    int getPriority() const;
-    void setPriority(int p);
-    
-    bool allowsPrefillOnly() const;
-    void setAllowPrefillOnly(bool allow);
-    
-    // ---- KV Cache Controls ----
-    
-    bool shouldReuseCache() const;
-    void setReuseCache(bool reuse);
-    
-    bool shouldFreeCacheOnFinish() const;
-    void setFreeCacheOnFinish(bool free);
+    RequestState getState() const;
+    void setState(RequestState state);
     
     // ---- Streaming ----
     
@@ -103,16 +106,15 @@ public:
     std::chrono::system_clock::time_point getArrivalTime() const;
     
     // ---- Runtime State (Mutable) ----
-    
     bool isCancelled() const;
     void cancel();
-    
+
     // ---- Execution State (Engine-Facing) ----
-    
     std::vector<int>& getGeneratedTokens();
     const std::vector<int>& getGeneratedTokens() const;
     void addGeneratedToken(int token);
-    int getGeneratedTokenCount() const;
+    int getGeneratedTokenCount() const;                // legacy alias
+    int getGeneratedLength() const;
     
     bool isFinished() const;
     bool isFailed() const;
@@ -129,29 +131,24 @@ public:
     void notifyToken(int token, bool finished);
 
 private:
-    // Immutable after submission
     std::string id_;
-    std::string prompt_;
-    std::vector<int> inputTokens_;
+    std::string promptText_;
+    std::vector<int> promptTokens_;
     int maxTokens_;
-    int minTokens_ = 0;
     
     std::vector<int> stopTokens_;
     std::string stopString_;
-    
+
     SamplingParams samplingParams_;
-    int priority_ = 0;
-    bool allowPrefillOnly_ = false;
-    bool reuseCache_ = false;
-    bool freeCacheOnFinish_ = true;
     bool streaming_ = true;
     
     uint64_t arrivalTimestampNs_;
     
     // Mutable runtime state
     std::atomic<bool> cancelled_{false};
-    
+
     // Engine-facing state
+    RequestState state_ = RequestState::Pending;
     std::vector<int> generatedTokens_;
     bool finished_ = false;
     bool failed_ = false;

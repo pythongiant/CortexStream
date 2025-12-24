@@ -4,29 +4,13 @@
 
 namespace cortexstream {
 
-// ============================================================================
-// SamplingParams Implementation
-// ============================================================================
-
-bool SamplingParams::isValid() const {
-    if (temperature < 0.0f || temperature > 2.0f) return false;
-    if (topK < 1 || topK > 100) return false;
-    if (topP <= 0.0f || topP > 1.0f) return false;
-    if (repetitionPenalty < 0.0f || repetitionPenalty > 2.0f) return false;
-    return true;
-}
-
-// ============================================================================
-// Request Implementation
-// ============================================================================
-
 Request::Request(const std::string& id,
-                 const std::string& prompt,
-                 const std::vector<int>& inputTokens,
-                 int maxTokens)
+                 const std::vector<int>& promptTokens,
+                 int maxTokens,
+                 const std::string& promptText)
     : id_(id),
-      prompt_(prompt),
-      inputTokens_(inputTokens),
+      promptText_(promptText),
+      promptTokens_(promptTokens),
       maxTokens_(maxTokens) {
     
     // Timestamp arrival (nanoseconds since epoch)
@@ -35,6 +19,14 @@ Request::Request(const std::string& id,
         now.time_since_epoch()
     ).count();
 }
+
+Request::Request(const std::string& id,
+                 const std::string& promptText,
+                 int maxTokens)
+    : Request(id, 
+              std::vector<int>(promptText.begin(), promptText.end()),
+              maxTokens,
+              promptText) {}
 
 Request::~Request() = default;
 
@@ -45,23 +37,31 @@ const std::string& Request::getId() const {
 }
 
 const std::string& Request::getPrompt() const {
-    return prompt_;
+    return promptText_;
+}
+
+const std::string& Request::getPromptText() const {
+    return promptText_;
 }
 
 const std::vector<int>& Request::getInputTokens() const {
-    return inputTokens_;
+    return promptTokens_;
+}
+
+const std::vector<int>& Request::getPromptTokens() const {
+    return promptTokens_;
 }
 
 int Request::getInputTokenCount() const {
-    return inputTokens_.size();
+    return static_cast<int>(promptTokens_.size());
+}
+
+int Request::getPromptLength() const {
+    return static_cast<int>(promptTokens_.size());
 }
 
 int Request::getMaxTokens() const {
     return maxTokens_;
-}
-
-int Request::getMinTokens() const {
-    return minTokens_;
 }
 
 // ---- Configuration ----
@@ -71,7 +71,7 @@ const SamplingParams& Request::getSamplingParams() const {
 }
 
 void Request::setSamplingParams(const SamplingParams& params) {
-    if (!params.isValid()) {
+    if (!params.validate()) {
         throw std::invalid_argument("Invalid sampling parameters");
     }
     samplingParams_ = params;
@@ -95,38 +95,17 @@ void Request::setStopString(const std::string& stopStr) {
 
 // ---- Scheduling Controls ----
 
-int Request::getPriority() const {
-    return priority_;
+RequestState Request::getState() const {
+    return state_;
 }
 
-void Request::setPriority(int p) {
-    priority_ = p;
-}
-
-bool Request::allowsPrefillOnly() const {
-    return allowPrefillOnly_;
-}
-
-void Request::setAllowPrefillOnly(bool allow) {
-    allowPrefillOnly_ = allow;
-}
-
-// ---- KV Cache Controls ----
-
-bool Request::shouldReuseCache() const {
-    return reuseCache_;
-}
-
-void Request::setReuseCache(bool reuse) {
-    reuseCache_ = reuse;
-}
-
-bool Request::shouldFreeCacheOnFinish() const {
-    return freeCacheOnFinish_;
-}
-
-void Request::setFreeCacheOnFinish(bool free) {
-    freeCacheOnFinish_ = free;
+void Request::setState(RequestState state) {
+    state_ = state;
+    if (state == RequestState::Finished) {
+        finished_ = true;
+    } else if (state == RequestState::Failed) {
+        failed_ = true;
+    }
 }
 
 // ---- Streaming ----
@@ -147,7 +126,8 @@ uint64_t Request::getArrivalTimestampNs() const {
 
 std::chrono::system_clock::time_point Request::getArrivalTime() const {
     auto duration = std::chrono::nanoseconds(arrivalTimestampNs_);
-    return std::chrono::system_clock::time_point(duration);
+    return std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        std::chrono::system_clock::time_point{} + duration);
 }
 
 // ---- Runtime State (Mutable) ----
@@ -174,8 +154,12 @@ void Request::addGeneratedToken(int token) {
     generatedTokens_.push_back(token);
 }
 
+int Request::getGeneratedLength() const {
+    return static_cast<int>(generatedTokens_.size());
+}
+
 int Request::getGeneratedTokenCount() const {
-    return generatedTokens_.size();
+    return getGeneratedLength();
 }
 
 bool Request::isFinished() const {
@@ -195,6 +179,7 @@ const std::string& Request::getErrorMessage() const {
 void Request::setError(const std::string& message) {
     failed_ = true;
     errorMessage_ = message;
+    state_ = RequestState::Failed;
 }
 
 // ---- Callbacks ----

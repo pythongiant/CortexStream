@@ -6,6 +6,7 @@ set(CORTEXSTREAM_SOURCES
     engine/engine.cpp
     engine/inference_engine.cpp
     engine/scheduler.cpp
+    model/model_backend.cpp
     model/sampling.cpp
     model/tokenizer.cpp
     request/request.cpp

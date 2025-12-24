@@ -297,6 +297,19 @@ KVCache::KVCache(size_t numLayers,
     allocator_ = std::make_unique<KVBlockAllocator>(totalBlocks_);
 }
 
+KVCache::KVCache(size_t cacheBytes,
+                 size_t hiddenSize,
+                 size_t numLayers)
+    : KVCache(
+          numLayers,
+          static_cast<size_t>(32),                                        // default heads
+          static_cast<size_t>(std::max<size_t>(1, hiddenSize / 32)),      // default head dim
+          std::max<size_t>(
+              1,
+              cacheBytes / (sizeof(float) * numLayers * 32ULL *
+                            std::max<size_t>(1, hiddenSize / 32) * 2ULL)), // approx tokens
+          16) {}
+
 KVCache::~KVCache() = default;
 
 bool KVCache::allocateFor(const std::string& requestId, int initialTokens) {
@@ -339,7 +352,7 @@ void KVCache::freeFor(const std::string& requestId) {
     }
 }
 
-Tensor KVCache::getKView(const std::string& requestId, int layer) {
+KVView KVCache::getKView(const std::string& requestId, int layer) {
     std::lock_guard<std::mutex> guard(lock_);
     
     auto it = sequences_.find(requestId);
@@ -353,14 +366,12 @@ Tensor KVCache::getKView(const std::string& requestId, int layer) {
     // Points to first block of this sequence in this layer
     float* data = getKBuffer(entry.handle.startBlockIndex, layer, 0, 0);
     
-    return {
-        data,
-        {numHeads_, static_cast<size_t>(entry.tokensUsed), headDim_},
-        true
-    };
+    return {data,
+            {numHeads_, static_cast<size_t>(entry.tokensUsed), headDim_},
+            true};
 }
 
-Tensor KVCache::getVView(const std::string& requestId, int layer) {
+KVView KVCache::getVView(const std::string& requestId, int layer) {
     std::lock_guard<std::mutex> guard(lock_);
     
     auto it = sequences_.find(requestId);
@@ -373,11 +384,9 @@ Tensor KVCache::getVView(const std::string& requestId, int layer) {
     // V tensor view: [numHeads, tokensUsed, headDim]
     float* data = getVBuffer(entry.handle.startBlockIndex, layer, 0, 0);
     
-    return {
-        data,
-        {numHeads_, static_cast<size_t>(entry.tokensUsed), headDim_},
-        true
-    };
+    return {data,
+            {numHeads_, static_cast<size_t>(entry.tokensUsed), headDim_},
+            true};
 }
 
 int KVCache::usedTokens(const std::string& requestId) const {

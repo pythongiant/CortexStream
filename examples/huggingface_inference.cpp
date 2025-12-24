@@ -36,10 +36,9 @@ int main(int argc, char* argv[]) {
     // On subsequent runs: Uses cached MLX weights (much faster)
     auto backend = std::make_shared<ModelBackend>(Device::MPS, DType::FP16);
     
-    // Load HuggingFace model (auto-downloads and converts if needed)
-    // Cache directory: ./models (or specify custom path)
-    if (!backend->loadHuggingFaceModel(modelId, "./models")) {
-        std::cerr << "❌ Failed to load HuggingFace model: " << modelId << std::endl;
+    // Load model (expects pre-converted MLX file or accessible path)
+    if (!backend->loadModel(modelId)) {
+        std::cerr << "❌ Failed to load model: " << modelId << std::endl;
         std::cerr << "   Make sure you have:" << std::endl;
         std::cerr << "   1. Internet connection (for downloading)" << std::endl;
         std::cerr << "   2. Enough disk space (~15GB for 7B model)" << std::endl;

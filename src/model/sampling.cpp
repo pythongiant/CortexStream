@@ -8,10 +8,6 @@
 #include <limits>
 #include <queue>
 
-// MLX headers for GPU-accelerated operations
-// Note: On Apple Silicon, MLX uses Metal Performance Shaders (MPS)
-#include <mlx/mlx.h>
-
 namespace cortexstream {
 
 // Validation helper
@@ -64,8 +60,8 @@ int Sampler::sampleToken(const Tensor& logits,
         workingLogits = applyRepetitionPenalty(workingLogits, generatedHistory);
     }
 
-    // Step 2: Greedy override
-    if (params.doSample || (params.topK == 1 && params.topP >= 1.0f)) {
+    // Step 2: Greedy override (when sampling disabled or trivial config)
+    if (!params.doSample || (params.topK == 1 && params.topP >= 1.0f)) {
         return greedySelect(workingLogits);
     }
 
@@ -137,31 +133,15 @@ void Sampler::initRNG() {
 }
 
 Tensor Sampler::applyTemperature(const Tensor& logits) {
-    // Vectorized temperature scaling using MLX on Apple Silicon
-    
     if (params.temperature <= 0.0f) {
         throw std::invalid_argument("Temperature must be positive");
     }
 
-    try {
-        // GPU vectorized operation via MLX
-        mlx::core::array mlx_logits = mlx::core::asarray(logits.data);
-        mlx_logits = mlx::core::reshape(mlx_logits, {static_cast<int>(logits.data.size())});
-        
-        // Element-wise division: logits / temperature (Metal-accelerated)
-        mlx::core::array scaled = mlx_logits / params.temperature;
-        
-        Tensor result = logits;
-        result.data = mlx::core::to_vector<float>(scaled);
-        return result;
-    } catch (...) {
-        // CPU fallback
-        Tensor result = logits;
-        for (auto& val : result.data) {
-            val = val / params.temperature;
-        }
-        return result;
+    Tensor result = logits;
+    for (auto& val : result.data) {
+        val = val / params.temperature;
     }
+    return result;
 }
 
 Tensor Sampler::applyRepetitionPenalty(const Tensor& logits,
@@ -220,50 +200,26 @@ Tensor Sampler::applyRepetitionPenalty(const Tensor& logits,
 }
 
 Tensor Sampler::softmaxNormalize(const Tensor& logits) {
-    // GPU-accelerated softmax using MLX on Apple Silicon
-    // Falls back to CPU if necessary
+    Tensor result = logits;
     
-    try {
-        // Convert to MLX array for GPU computation
-        // Input: logits.data is a vector of floats
-        mlx::core::array mlx_logits = mlx::core::asarray(logits.data);
-        // Reshape to 1D if needed
-        if (mlx_logits.size() == logits.data.size()) {
-            mlx_logits = mlx::core::reshape(mlx_logits, {static_cast<int>(logits.data.size())});
-        }
-        
-        // Apply softmax with numerical stability
-        mlx::core::array normalized = mlx::core::softmax(mlx_logits);
-        
-        // Convert back to CPU tensor
-        Tensor result = logits;
-        std::vector<float> normalized_data = mlx::core::to_vector<float>(normalized);
-        result.data = normalized_data;
-        
-        return result;
-    } catch (...) {
-        // Fallback to CPU softmax if MLX unavailable
-        Tensor result = logits;
-        
-        // Numerical stability: subtract max
-        float maxLogit = *std::max_element(result.data.begin(), result.data.end());
-        
-        // Exp and sum
-        float sum = 0.0f;
-        for (auto& val : result.data) {
-            val = std::exp(std::clamp(val - maxLogit, MIN_LOGIT, MAX_LOGIT));
-            sum += val;
-        }
-
-        // Normalize
-        if (sum > 0.0f) {
-            for (auto& val : result.data) {
-                val = val / sum;
-            }
-        }
-
-        return result;
+    // Numerical stability: subtract max
+    float maxLogit = *std::max_element(result.data.begin(), result.data.end());
+    
+    // Exp and sum
+    float sum = 0.0f;
+    for (auto& val : result.data) {
+        val = std::exp(std::clamp(val - maxLogit, MIN_LOGIT, MAX_LOGIT));
+        sum += val;
     }
+
+    // Normalize
+    if (sum > 0.0f) {
+        for (auto& val : result.data) {
+            val = val / sum;
+        }
+    }
+
+    return result;
 }
 
 
@@ -506,9 +462,6 @@ std::vector<std::pair<float, int>> Sampler::getNucleus(
 }
 
 int Sampler::categoricalSample(const std::vector<float>& probs) {
-    // Optimized categorical sampling with MLX GPU kernels on Apple Silicon
-    // Fallback to CPU if MLX unavailable
-    
     if (probs.empty()) {
         return 0;
     }
@@ -520,33 +473,19 @@ int Sampler::categoricalSample(const std::vector<float>& probs) {
         return std::max_element(probs.begin(), probs.end()) - probs.begin();
     }
 
-    try {
-        // Try GPU sampling via MLX on Apple Silicon
-        mlx::core::array mlx_probs = mlx::core::asarray(probs);
-        mlx_probs = mlx::core::reshape(mlx_probs, {static_cast<int>(probs.size())});
-        
-        // MLX categorical sampling on GPU (Metal)
-        // Uses optimized random number generation on MPS
-        mlx::core::array sample_result = mlx::core::multinomial(mlx_probs, 1);
-        
-        // Extract sampled index
-        int selected = mlx::core::to_vector<int32_t>(sample_result)[0];
-        return std::max(0, std::min(selected, static_cast<int>(probs.size()) - 1));
-    } catch (...) {
-        // CPU fallback: inverse transform sampling
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        float rand = dist(rng);
-        
-        float cumProb = 0.0f;
-        for (size_t i = 0; i < probs.size(); ++i) {
-            cumProb += probs[i];
-            if (rand < cumProb) {
-                return i;
-            }
+    // CPU inverse-transform sampling
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    float rand = dist(rng);
+    
+    float cumProb = 0.0f;
+    for (size_t i = 0; i < probs.size(); ++i) {
+        cumProb += probs[i];
+        if (rand < cumProb) {
+            return static_cast<int>(i);
         }
-
-        return probs.size() - 1;
     }
+
+    return static_cast<int>(probs.size() - 1);
 }
 
 float Sampler::computeEntropy(const std::vector<float>& probs) {

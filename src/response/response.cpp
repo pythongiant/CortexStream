@@ -28,8 +28,6 @@ Response::Response(const std::string& reqId)
     ).count();
 }
 
-Response::~Response() = default;
-
 // ---- Identity ----
 
 const std::string& Response::getRequestId() const {
