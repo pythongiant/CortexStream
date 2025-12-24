@@ -2,18 +2,13 @@
 
 set(CORTEXSTREAM_SOURCES
     cache/kv_cache.cpp
-    cache/allocator.cpp
     engine/engine.cpp
-    engine/inference_engine.cpp
     engine/scheduler.cpp
     model/model_backend.cpp
     model/sampling.cpp
     model/tokenizer.cpp
     request/request.cpp
-    request/response.cpp
     response/response.cpp
-    utils/log.cpp
-    utils/metrics.cpp
 )
 
 # Create CortexStream library
@@ -39,6 +34,20 @@ if(mlx_FOUND)
 else()
     message(STATUS "MLX framework not found - CPU fallback only")
 endif()
+
+# Add compiler flags to suppress warnings
+target_compile_options(cortexstream PRIVATE
+    -Wno-unused-parameter
+    -Wno-deprecated-copy
+)
+
+# Link tokenizers-cpp library
+target_link_libraries(cortexstream PRIVATE tokenizers_cpp)
+
+# Add include directories for tokenizers-cpp
+target_include_directories(cortexstream PRIVATE
+    ${tokenizers_cpp_SOURCE_DIR}/include
+)
 
 # OpenMP for parallelization
 find_package(OpenMP QUIET)
@@ -91,3 +100,4 @@ if(APPLE)
         -ffast-math
     )
 endif()
+

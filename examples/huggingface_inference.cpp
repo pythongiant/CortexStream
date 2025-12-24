@@ -18,7 +18,72 @@
 #include <memory>
 #include <string>
 
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <sstream>
+
+#if defined(CORTEXSTREAM_WITH_TOKENIZERS_CPP)
+#include <tokenizers_cpp.h>
+#endif
+
 using namespace cortexstream;
+
+static bool readFileToString(const std::filesystem::path& path, std::string* out) {
+    std::ifstream ifs(path, std::ios::in | std::ios::binary);
+    if (!ifs) {
+        return false;
+    }
+    std::ostringstream ss;
+    ss << ifs.rdbuf();
+    *out = ss.str();
+    return true;
+}
+
+static std::optional<std::filesystem::path> findTokenizerFile(
+    const std::filesystem::path& cacheDir,
+    const std::string& modelId) {
+
+    std::error_code ec;
+    std::vector<std::filesystem::path> roots;
+    roots.push_back(cacheDir / modelId);
+    roots.push_back(cacheDir);
+
+    for (const auto& root : roots) {
+        if (!std::filesystem::exists(root, ec)) {
+            continue;
+        }
+
+        if (std::filesystem::is_regular_file(root, ec)) {
+            auto filename = root.filename().string();
+            if (filename == "tokenizer.json" || filename == "tokenizer.model") {
+                return root;
+            }
+        }
+
+        if (!std::filesystem::is_directory(root, ec)) {
+            continue;
+        }
+
+        for (auto it = std::filesystem::recursive_directory_iterator(root, ec);
+             it != std::filesystem::recursive_directory_iterator();
+             it.increment(ec)) {
+
+            if (ec) {
+                break;
+            }
+
+            const auto& p = it->path();
+            auto filename = p.filename().string();
+            if (filename == "tokenizer.json" || filename == "tokenizer.model") {
+                return p;
+            }
+        }
+    }
+
+    return std::nullopt;
+}
 
 int main(int argc, char* argv[]) {
     std::cout << "=== CortexStream HuggingFace Model Inference ===" << std::endl;
@@ -27,6 +92,11 @@ int main(int argc, char* argv[]) {
     std::string modelId = "mistralai/Mistral-7B";
     if (argc > 1) {
         modelId = argv[1];
+    }
+
+    std::string cacheDir = "./models";
+    if (argc > 2) {
+        cacheDir = argv[2];
     }
     
     std::cout << "\n[Model] Loading HuggingFace model: " << modelId << std::endl;
@@ -50,6 +120,37 @@ int main(int argc, char* argv[]) {
     std::cout << "   Architecture: " << backend->getNumLayers() << " layers, "
               << backend->getHiddenSize() << " hidden size, "
               << backend->getVocabSize() << " vocab size" << std::endl;
+
+#if defined(CORTEXSTREAM_WITH_TOKENIZERS_CPP)
+    std::unique_ptr<tokenizers::Tokenizer> tokenizer;
+    {
+        std::cout << "\n[Tokenizer] Loading tokenizer (cacheDir=" << cacheDir << ")..." << std::endl;
+        auto tokPathOpt = findTokenizerFile(std::filesystem::path(cacheDir), modelId);
+        if (!tokPathOpt) {
+            std::cout << "⚠️  Tokenizer not found under cache directory; responses will be shown as token IDs." << std::endl;
+            std::cout << "   Tip: pass cache dir as second argument: ./huggingface_inference \"" << modelId
+                      << "\" \"./models\"" << std::endl;
+        } else {
+            const auto& tokPath = *tokPathOpt;
+            std::string blob;
+            if (!readFileToString(tokPath, &blob)) {
+                std::cout << "⚠️  Failed to read tokenizer file: " << tokPath.string() << std::endl;
+            } else {
+                if (tokPath.filename() == "tokenizer.json") {
+                    tokenizer = tokenizers::Tokenizer::FromBlobJSON(blob);
+                } else if (tokPath.filename() == "tokenizer.model") {
+                    tokenizer = tokenizers::Tokenizer::FromBlobSentencePiece(blob);
+                }
+
+                if (!tokenizer) {
+                    std::cout << "⚠️  Tokenizer load failed (unsupported tokenizer format)." << std::endl;
+                } else {
+                    std::cout << "✅ Tokenizer loaded: " << tokPath.string() << std::endl;
+                }
+            }
+        }
+    }
+#endif
     
     // 2. Initialize components
     std::cout << "\n[Setup] Initializing inference pipeline..." << std::endl;
@@ -129,11 +230,44 @@ int main(int argc, char* argv[]) {
         std::cout << "\n--- Request " << i << " ---" << std::endl;
         std::cout << "Prompt: " << prompts[i] << std::endl;
         
-        // Completion would be collected from streaming responses
-        // For now, show request stats
         std::cout << "Tokens generated: " << req->getGeneratedLength() << std::endl;
-        std::cout << "Status: " << (req->getState() == RequestState::Finished 
-                                     ? "✅ Completed" : "⏳ In progress") << std::endl;
+        if (req->getState() == RequestState::Finished) {
+            std::cout << "Status: ✅ Completed" << std::endl;
+        } else if (req->getState() == RequestState::Failed) {
+            std::cout << "Status: ❌ Failed" << std::endl;
+            std::cout << "Error: " << req->getErrorMessage() << std::endl;
+        } else {
+            std::cout << "Status: ⏳ In progress" << std::endl;
+        }
+
+        if (req->getState() == RequestState::Finished) {
+            const auto& gen = req->getGeneratedTokens();
+
+#if defined(CORTEXSTREAM_WITH_TOKENIZERS_CPP)
+            if (tokenizer) {
+                std::vector<int32_t> ids;
+                ids.reserve(gen.size());
+                for (int t : gen) {
+                    ids.push_back(static_cast<int32_t>(t));
+                }
+                std::string decoded = tokenizer->Decode(ids);
+                std::cout << "\nResponse:\n" << decoded << std::endl;
+            } else
+#endif
+            {
+                std::cout << "\nResponse (token IDs; build with -DWITH_TOKENIZERS_CPP=ON to decode):\n";
+                std::cout << "[";
+                size_t limit = std::min<size_t>(gen.size(), 64);
+                for (size_t j = 0; j < limit; ++j) {
+                    if (j) std::cout << ' ';
+                    std::cout << gen[j];
+                }
+                if (gen.size() > limit) {
+                    std::cout << " ...";
+                }
+                std::cout << "]" << std::endl;
+            }
+        }
     }
     
     // 6. Print statistics

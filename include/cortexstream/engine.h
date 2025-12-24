@@ -48,9 +48,6 @@
 
 namespace cortexstream {
 
-// Forward declaration
-class StreamManager;
-
 struct EngineStats {
     size_t tokensProcessed = 0;
     size_t requestsCompleted = 0;

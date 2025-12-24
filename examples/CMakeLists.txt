@@ -1,5 +1,8 @@
 # Example applications for CortexStream
 
+# tokenizers_cpp is already fetched in Dependencies.cmake
+option(WITH_TOKENIZERS_CPP "Enable token decoding in examples" ON)
+
 # Simple inference example
 add_executable(simple_inference simple_inference.cpp)
 target_link_libraries(simple_inference PRIVATE cortexstream)
@@ -27,6 +30,12 @@ target_link_libraries(huggingface_inference PRIVATE cortexstream)
 target_include_directories(huggingface_inference PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
 )
+
+if(WITH_TOKENIZERS_CPP)
+    target_link_libraries(huggingface_inference PRIVATE tokenizers_cpp)
+    target_include_directories(huggingface_inference PRIVATE ${tokenizers_cpp_SOURCE_DIR}/include)
+    target_compile_definitions(huggingface_inference PRIVATE CORTEXSTREAM_WITH_TOKENIZERS_CPP=1)
+endif()
 
 # Optimization flags for examples
 foreach(example

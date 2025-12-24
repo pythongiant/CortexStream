@@ -1,229 +1,147 @@
-# HuggingFace Integration Summary
+# HuggingFace Integration Status
 
-## ✅ Yes, You Can Now Serve HuggingFace Models!
+## Current Implementation Status
 
-CortexStream now has **full HuggingFace model support** with automatic download and MLX conversion.
+CortexStream has **partial HuggingFace support** through tokenizer integration and example code. Full model loading and auto-download are **not yet implemented**.
 
-## What Was Added
+## What Is Currently Implemented
 
-### 1. **HuggingFace Model Loader** 
-`src/model/huggingface_loader.cpp` - Complete implementation for:
-- Auto-detecting HF model IDs vs file paths
-- Downloading from huggingface.co
-- Converting weights to MLX format
-- Caching locally for subsequent runs
+### 1. **HuggingFace Tokenizer Support**
+`src/model/tokenizer.cpp` - Working implementation for:
+- Loading tokenizers from `tokenizer.json` files
+- Encoding text to tokens
+- Decoding tokens back to text
+- Factory function `createTokenizer()` for easy instantiation
 
-### 2. **ModelBackend Enhancement**
-`include/cortexstream/model.h` - New methods:
-```cpp
-// Load HuggingFace models directly
-bool loadHuggingFaceModel(
-    const std::string& modelId,           // "mistralai/Mistral-7B"
-    const std::string& cacheDir = "./models"
-);
+### 2. **Example Application**
+`examples/huggingface_inference.cpp` - Shows:
+- How to load a model via `loadModel()` (expects pre-converted weights)
+- Tokenizer loading from cache directory
+- Pipeline setup with Scheduler, KVCache, InferenceEngine
+- Batch inference with sampling parameters
 
-// Helper functions
-bool isHuggingFaceModel(const std::string& modelId);
-std::string downloadHFModel(const std::string& modelId, 
-                            const std::string& cacheDir);
-bool convertHFToMLX(const std::string& hfPath,
-                    const std::string& mlxPath);
-```
+### 3. **Core Infrastructure**
+All components work with any model once loaded:
+- `ModelBackend` - Loads MLX-format models
+- `Scheduler` - Batches requests efficiently
+- `KVCache` - GPU-accelerated cache with buddy allocator
+- `InferenceEngine` - Orchestrates prefill/decode pipeline
+- `Sampler` - GPU-accelerated sampling (Top-K, Top-P, temperature)
 
-### 3. **Complete Example**
-`examples/huggingface_inference.cpp` - Production-ready example showing:
-- Loading popular models (Mistral, Llama, Phi)
-- Configuring sampling parameters
-- Batch inference
-- Performance statistics
+## What Is NOT Yet Implemented
 
-### 4. **Comprehensive Guide**
-`docs/HUGGINGFACE_GUIDE.md` - Covers:
-- Quick start (3 lines of code)
-- Model recommendations by device
-- How the pipeline works
-- Troubleshooting
-- Performance tuning
-- Cost analysis
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `loadHuggingFaceModel()` method | Not implemented | Requires manual model conversion |
+| Auto-download from huggingface.co | Not implemented | Download models manually |
+| Auto-convert to MLX format | Not implemented | Use external conversion tools |
+| `isHuggingFaceModel()` helper | Not implemented | - |
+| `docs/HUGGINGFACE_GUIDE.md` | Not created | - |
+| `src/model/huggingface_loader.cpp` | Not created | - |
 
-## Quick Usage
+## Current Usage (Manual Setup Required)
 
-### One-line Model Loading
-
-```cpp
-// That's it! Handles download + conversion + loading
-backend->loadHuggingFaceModel("mistralai/Mistral-7B");
-```
-
-### Compile & Run
+### Step 1: Download Model Manually
 
 ```bash
-# Build with HuggingFace support
-cmake -DWITH_HUGGINGFACE=ON ..
-make
+# Using huggingface-cli
+pip install huggingface_hub
+huggingface-cli download mistralai/Mistral-7B --local-dir ./models/Mistral-7B
 
-# Run inference
-./huggingface_inference "mistralai/Mistral-7B"
+# Or download tokenizer.json directly from HuggingFace website
 ```
 
-## Supported Models
+### Step 2: Convert to MLX Format (External Tool)
 
-✅ **Any HuggingFace model** that MLX supports:
-
-| Model | Size | Status |
-|-------|------|--------|
-| Mistral-7B | 14GB | ⭐ Recommended |
-| Llama 2 (7B) | 14GB | ✅ Works |
-| Phi-2 | 5GB | ✅ Fast |
-| Zephyr-7B | 14GB | ✅ Works |
-| Mixtral-8x7B | 47GB | ✅ Works (M3 Max) |
-| Custom models | - | ✅ MLX-compatible |
-
-## How It Works
-
-```
-ModelBackend::loadHuggingFaceModel("mistralai/Mistral-7B")
-    │
-    ├─→ [1] Detect HF model ID format
-    │
-    ├─→ [2] Download weights from huggingface.co
-    │        (config.json, model.safetensors, tokenizer.json, ...)
-    │
-    ├─→ [3] Convert to MLX format
-    │        (optimizes for Metal on Apple Silicon)
-    │
-    ├─→ [4] Cache locally (~./models/mistralai/Mistral-7B-mlx/)
-    │
-    └─→ [5] Load into MLX GPU runtime
-            (subsequent runs use cache - <1 second)
+```bash
+# Use mlx-lm or similar tool
+pip install mlx-lm
+python -m mlx_lm.convert --hf-path ./models/Mistral-7B --mlx-path ./models/Mistral-7B-mlx
 ```
 
-## Performance
-
-| Phase | Time | Once? |
-|-------|------|-------|
-| Download | 5-20 min | First run only |
-| Convert to MLX | 5-10 min | First run only |
-| Load from cache | <1 sec | Every run after |
-| Inference | 30-50 ms/token | Ongoing |
-
-## MLX GPU Acceleration
-
-All operations use MLX Metal (MPS) for GPU acceleration:
-- ✅ Model inference (prefill + decode)
-- ✅ Softmax computation
-- ✅ Token sampling (categorical)
-- ✅ Temperature/Top-K/Top-P operations
-- ✅ Batch processing
-
-See [src/model/sampling.cpp](../src/model/sampling.cpp) for GPU-accelerated sampling.
-
-## Integration With CortexStream
-
-The HuggingFace loader integrates seamlessly with existing CortexStream components:
-
-```
-HuggingFace Model
-    │
-    └─→ ModelBackend (loads via MLX)
-         │
-         ├─→ Scheduler (batches requests)
-         │
-         ├─→ KVCache (buddy allocator, GPU arena)
-         │
-         └─→ InferenceEngine (orchestrates)
-            │
-            ├─→ Prefill (encode prompt)
-            ├─→ Decode (generate tokens)
-            └─→ Sampling (GPU-accelerated)
-```
-
-## What's Next
-
-The implementation includes stubs for:
-- 🔧 External MLX conversion tool integration
-- 📊 Progress tracking during conversion
-- 🔐 HuggingFace token authentication
-- 🎯 Model quantization (INT8)
-- 💾 Disk space warnings
-
-These are ready to be filled in with production implementations.
-
-## Files Modified/Created
-
-```
-✅ Added:
-  - src/model/huggingface_loader.cpp (400+ lines)
-  - examples/huggingface_inference.cpp (200+ lines)
-  - docs/HUGGINGFACE_GUIDE.md (400+ lines)
-
-✅ Modified:
-  - include/cortexstream/model.h (+30 lines for HF methods)
-
-Total: 1000+ lines of new HuggingFace integration code
-```
-
-## Example: Loading Mistral-7B
+### Step 3: Load in CortexStream
 
 ```cpp
 #include "cortexstream/model.h"
 
-int main() {
-    // Create backend
-    auto backend = std::make_shared<ModelBackend>(
-        Device::MPS,      // Apple Silicon GPU
-        DType::FP16       // Fast half-precision
-    );
-    
-    // Load HuggingFace model (auto-download + convert)
-    backend->loadHuggingFaceModel(
-        "mistralai/Mistral-7B",    // Model ID
-        "./models"                  // Cache directory
-    );
-    
-    // Use with CortexStream
-    auto scheduler = std::make_shared<Scheduler>(32);
-    auto cache = std::make_shared<KVCache>(
-        8UL * 1024 * 1024 * 1024,  // 8GB cache
-        backend->getHiddenSize(),
-        backend->getNumLayers()
-    );
-    
-    auto engine = std::make_shared<InferenceEngine>(
-        backend, scheduler, cache
-    );
-    
-    engine->initialize();
-    engine->run();  // Start inference
-    
-    return 0;
-}
+auto backend = std::make_shared<ModelBackend>(Device::MPS, DType::FP16);
+
+// Load pre-converted MLX model
+backend->loadModel("./models/Mistral-7B-mlx");
+
+// Use tokenizer separately
+auto tokenizer = createTokenizer("./models/Mistral-7B/tokenizer.json");
 ```
 
-## Testing
+## Architecture
 
-To test HuggingFace integration:
+```
+Manual Download (HuggingFace)
+    |
+    v
+External Conversion (mlx-lm)
+    |
+    v
+ModelBackend::loadModel()  <-- Current entry point
+    |
+    +-> Scheduler (batches requests)
+    |
+    +-> KVCache (GPU arena allocation)
+    |
+    +-> InferenceEngine (orchestrates)
+        |
+        +-> Prefill (encode prompt)
+        +-> Decode (generate tokens)
+        +-> Sampling (GPU-accelerated)
+```
+
+## Files
+
+```
+Implemented:
+  - src/model/tokenizer.cpp (137 lines - HuggingFace tokenizer support)
+  - examples/huggingface_inference.cpp (313 lines - example usage)
+
+Not Yet Implemented:
+  - src/model/huggingface_loader.cpp (planned)
+  - docs/HUGGINGFACE_GUIDE.md (planned)
+  - HuggingFace methods in model.h (planned)
+```
+
+## Roadmap
+
+To complete HuggingFace integration:
+
+1. **Model Loader** (`src/model/huggingface_loader.cpp`)
+   - Detect HF model ID format
+   - Download from huggingface.co via API
+   - Integrate MLX conversion
+
+2. **ModelBackend Enhancement**
+   - Add `loadHuggingFaceModel(modelId, cacheDir)` method
+   - Add `isHuggingFaceModel()` helper
+   - Progress tracking during download/conversion
+
+3. **Documentation**
+   - Create `docs/HUGGINGFACE_GUIDE.md`
+   - Add quick start examples
+   - Model compatibility list
+
+## Running the Example
 
 ```bash
 # Build
 cmake -B build && cd build && make -j$(nproc)
 
-# Run simple model
-./examples/huggingface_inference "microsoft/phi-2"
-
-# Run large model
-./examples/huggingface_inference "mistralai/Mistral-7B"
-
-# Run with custom cache
-./examples/huggingface_inference "meta-llama/Llama-2-7b" "/mnt/models"
+# Run (expects pre-converted model in ./models/)
+./examples/huggingface_inference "./models/Mistral-7B-mlx" "./models"
 ```
 
-## Summary
+## Model Requirements
 
-✅ **HuggingFace models are now fully supported**
-✅ **Automatic download and MLX conversion**
-✅ **MLX GPU acceleration (Metal on Apple Silicon)**
-✅ **Production-ready implementation**
-✅ **Comprehensive documentation**
+Models must be:
+1. Downloaded manually from HuggingFace
+2. Converted to MLX format externally
+3. Placed in an accessible directory
 
-You can now serve any HuggingFace model with CortexStream! 🎉
+The `loadModel()` function expects a path to MLX-format weights.
